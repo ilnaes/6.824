@@ -13,6 +13,8 @@ type Clerk struct {
 	sm     *shardmaster.Clerk
 	config shardmaster.Config
 	// You'll have to modify Clerk.
+	lastID int64
+	me     int64
 }
 
 func nrand() int64 {
@@ -26,6 +28,7 @@ func MakeClerk(shardmasters []string) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardmaster.MakeClerk(shardmasters)
 	// You'll have to modify MakeClerk.
+	ck.me = nrand()
 	return ck
 }
 
@@ -87,6 +90,7 @@ func (ck *Clerk) Get(key string) string {
 	defer ck.mu.Unlock()
 
 	// You'll have to modify Get().
+	OpID := nrand()
 
 	for {
 		shard := key2shard(key)
@@ -95,14 +99,19 @@ func (ck *Clerk) Get(key string) string {
 
 		servers, ok := ck.config.Groups[gid]
 
+		args := &GetArgs{}
+		args.Key = key
+		args.Ck = ck.me
+		args.OpID = OpID
+		args.LastID = ck.lastID
+
 		if ok {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
-				args := &GetArgs{}
-				args.Key = key
 				var reply GetReply
 				ok := call(srv, "DisKV.Get", args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					ck.lastID = OpID
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
@@ -123,6 +132,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.mu.Lock()
 	defer ck.mu.Unlock()
 
+	OpID := nrand()
+
 	// You'll have to modify PutAppend().
 
 	for {
@@ -132,13 +143,17 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 		servers, ok := ck.config.Groups[gid]
 
+		args := &PutAppendArgs{}
+		args.Op = op
+		args.Key = key
+		args.Value = value
+		args.Ck = ck.me
+		args.OpID = OpID
+		args.LastID = ck.lastID
+
 		if ok {
 			// try each server in the shard's replication group.
 			for _, srv := range servers {
-				args := &PutAppendArgs{}
-				args.Key = key
-				args.Value = value
-				args.Op = op
 				var reply PutAppendReply
 				ok := call(srv, "DisKV.PutAppend", args, &reply)
 				if ok && reply.Err == OK {
