@@ -101,6 +101,7 @@ func (tc *tCluster) start1(gi int, si int) {
 }
 
 func (tc *tCluster) kill1(gi int, si int, deletefiles bool) {
+	fmt.Printf("KILLING %d-%d  %t\n", gi, si, deletefiles)
 	g := tc.groups[gi]
 	s := g.servers[si]
 	if s.p != nil {
@@ -162,6 +163,7 @@ func (tc *tCluster) space() int64 {
 	var bytes int64 = 0
 	ff := func(_ string, info os.FileInfo, err error) error {
 		if err == nil && info.Mode().IsDir() == false {
+			fmt.Printf("%s SIZE %d\n", info.Name(), info.Size())
 			bytes += info.Size()
 		}
 		return nil
@@ -651,6 +653,8 @@ func Test5DiskUse(t *testing.T) {
 		nb := tc.space()
 		if nb > max {
 			t.Fatalf("using too many bytes on disk (%v)", nb)
+		} else {
+			fmt.Printf("using %v bytes\n", nb)
 		}
 	}
 
@@ -662,6 +666,8 @@ func Test5DiskUse(t *testing.T) {
 		nb := tc.space()
 		if nb > max {
 			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		} else {
+			fmt.Printf("using %v bytes\n", nb)
 		}
 	}
 
@@ -684,6 +690,8 @@ func Test5DiskUse(t *testing.T) {
 		nb := tc.space()
 		if nb > max {
 			t.Fatalf("using too many bytes on disk (%v > %v)", nb, max)
+		} else {
+			fmt.Printf("using %v bytes\n", nb)
 		}
 	}
 
@@ -1110,16 +1118,21 @@ func Test5Simultaneous(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		go ff(i)
 
+		fmt.Printf("HERE!!!!!!!!!!!!!!!!!!!!!!!!! %d\n", i)
+
 		time.Sleep(time.Duration(rand.Int()%200) * time.Millisecond)
 		if (rand.Int() % 1000) < 500 {
 			tc.kill1(0, i%3, false)
+			fmt.Printf("KILLED SERVER INTACT %d!\n", i%3)
 		} else {
 			tc.kill1(0, i%3, true)
+			fmt.Printf("KILLED SERVER WIPE %d!\n", i%3)
 		}
 		time.Sleep(1000 * time.Millisecond)
 		vx := ck.Get(k1)
 		checkAppends(t, vx, counts)
 		tc.start1(0, i%3)
+		fmt.Printf("STARTED SERVER %d!\n", i%3)
 		time.Sleep(2200 * time.Millisecond)
 
 		z := <-ch

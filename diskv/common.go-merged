@@ -58,12 +58,3 @@ type UpdateArgs struct {
 type UpdateReply struct {
 	Err Err
 }
-
-type RecoverArgs struct {
-}
-
-type RecoverReply struct {
-	Px  string
-	Kv  string
-	Err Err
-}

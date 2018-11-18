@@ -1,0 +1,10 @@
+*.swp
+tags
+mrtmp.*
+/main/diff.out
+/mapreduce/x.txt
+/pbservice/x.txt
+/kvpaxos/x.txt
+/main/diskvd
+github.com
+log

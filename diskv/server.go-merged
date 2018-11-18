@@ -1,6 +1,5 @@
 package diskv
 
-import "bytes"
 import "net"
 import "fmt"
 import "net/rpc"
@@ -46,6 +45,22 @@ type Op struct {
 	Clients map[int64]int
 }
 
+func printOp(op Op) string {
+	switch op.Type {
+	case "Get":
+		return "GET " + op.Key
+	case "Put":
+		return "PUT " + op.Value + " INTO " + op.Key
+	case "Append":
+		return "APPEND " + op.Value + " INTO " + op.Key
+	case "Update":
+		return fmt.Sprintf("UPDATE %d FROM %d", op.View, op.GID)
+	case "Reconfig":
+		return fmt.Sprintf("RECONFIG %d", op.Config.Num)
+	}
+	return "ERROR"
+}
+
 type DisKV struct {
 	mu         sync.Mutex
 	l          net.Listener
@@ -59,13 +74,12 @@ type DisKV struct {
 	gid int64 // my replica group ID
 
 	// Your definitions here.
-	Seq         int
-	Current     shardmaster.Config
-	Data        map[string]string
-	SeenOpID    map[int64]int
-	HasShard    [shardmaster.NShards]bool
-	Outstanding map[int64]bool
-	recovery    bool
+	seq         int
+	current     shardmaster.Config
+	data        map[string]string
+	seenOpID    map[int64]int
+	hasShard    [shardmaster.NShards]bool
+	outstanding map[int64]bool
 }
 
 //
@@ -158,21 +172,6 @@ func (kv *DisKV) fileReplaceShard(shard int, m map[string]string) {
 	}
 }
 
-func (kv *DisKV) log() {
-	// pxname := "/Users/seanli/tmp/paxos"
-	kvname := kv.dir + "/kv"
-	file, err := os.Create(kvname + "-tmp")
-	if err != nil {
-		fmt.Println("Couldn't open file!")
-		return
-	}
-	encoder := gob.NewEncoder(file)
-	encoder.Encode(kv)
-	file.Close()
-
-	os.Rename(kvname+"-tmp", kvname)
-}
-
 func copyMap(m map[int64]int) map[int64]int {
 	if m == nil {
 		return nil
@@ -210,16 +209,16 @@ func (kv *DisKV) getOp(seq int) Op {
 func (kv *DisKV) handleReq(id int64, shard int, op Op) Err {
 	for !kv.isdead() {
 		// are we assigned shard?
-		if kv.Current.Shards[shard] == kv.gid {
+		if kv.current.Shards[shard] == kv.gid {
 
 			// do we have shard?
-			if kv.HasShard[shard] {
+			if kv.hasShard[shard] {
 
 				// have we seen opID before?
-				if kv.SeenOpID[id] == 0 {
+				if kv.seenOpID[id] == 0 {
 
-					kv.Seq++
-					seq := kv.Seq
+					kv.seq++
+					seq := kv.seq
 
 					kv.px.Start(seq, op)
 					xop := kv.getOp(seq)
@@ -242,66 +241,56 @@ func (kv *DisKV) handleReq(id int64, shard int, op Op) Err {
 }
 
 func (kv *DisKV) process(op Op, seq int, server int64) {
-	if Debug != 0 {
-		fmt.Printf("%d PROCESSING %d\n", kv.me, seq)
-	}
-
 	if op.Type == "Reconfig" {
 		kv.doReconfig(op)
-		kv.log()
-		kv.px.Done(seq)
 		return
 	}
 	if op.Type == "Update" {
 		kv.doUpdate(op)
-		kv.log()
-		kv.px.Done(seq)
 		return
 	}
-	if op.Type == "Recover" || op.Type == "Heartbeat" {
-		kv.log()
-		kv.px.Done(seq)
-		return
-	}
+
+	kv.seenOpID[op.OpID] = seq
 
 	if op.Type == "Append" {
-		kv.Data[op.Key] += op.Value
+		kv.data[op.Key] += op.Value
 	} else if op.Type == "Put" {
-		kv.Data[op.Key] = op.Value
+		kv.data[op.Key] = op.Value
 	}
-
-	kv.SeenOpID[op.OpID] = seq
-	kv.px.Done(seq)
 
 	// did we get a request from op's server?
 	if op.Ck == server {
-		delete(kv.SeenOpID, op.LastID)
-	}
+		lastSeq, ok := kv.seenOpID[op.LastID]
 
-	kv.log()
+		if !ok {
+			return
+		}
+		// only call done if not copied op
+		if lastSeq > 0 {
+			kv.px.Done(lastSeq)
+		}
+		delete(kv.seenOpID, op.LastID)
+	}
 }
 
 func (kv *DisKV) Get(args *GetArgs, reply *GetReply) error {
 	// Your code here.
-	// fmt.Printf("GET %d %t --- %d\n", kv.me, kv.recovery, kv.Seq+1)
-	if !kv.recovery {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-		op := Op{OpID: args.OpID, Type: "Get", Key: args.Key, Ck: args.Ck, LastID: args.LastID}
-		err := kv.handleReq(args.OpID, key2shard(args.Key), op)
+	op := Op{OpID: args.OpID, Type: "Get", Key: args.Key, Ck: args.Ck, LastID: args.LastID}
+	err := kv.handleReq(args.OpID, key2shard(args.Key), op)
 
-		if err == OK {
-			val, ok := kv.Data[args.Key]
-			if !ok {
-				reply.Err = ErrNoKey
-			} else {
-				reply.Err = OK
-				reply.Value = val
-			}
+	if err == OK {
+		val, ok := kv.data[args.Key]
+		if !ok {
+			reply.Err = ErrNoKey
 		} else {
-			reply.Err = err
+			reply.Err = OK
+			reply.Value = val
 		}
+	} else {
+		reply.Err = err
 	}
 	return nil
 }
@@ -309,39 +298,34 @@ func (kv *DisKV) Get(args *GetArgs, reply *GetReply) error {
 // RPC handler for client Put and Append requests
 func (kv *DisKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// Your code here.
-	// fmt.Printf("PUTAPPEND %d %t --- %d\n", kv.me, kv.recovery, kv.Seq+1)
-	if !kv.recovery {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 
-		var op Op
-		if args.Op == "Put" {
-			op = Op{OpID: args.OpID, Type: "Put", Key: args.Key, Value: args.Value,
-				Ck: args.Ck, LastID: args.LastID}
-		} else {
-			op = Op{OpID: args.OpID, Type: "Append", Key: args.Key, Value: args.Value,
-				Ck: args.Ck, LastID: args.LastID}
-		}
-		reply.Err = kv.handleReq(args.OpID, key2shard(args.Key), op)
+	var op Op
+	if args.Op == "Put" {
+		op = Op{OpID: args.OpID, Type: "Put", Key: args.Key, Value: args.Value, Ck: args.Ck, LastID: args.LastID}
+	} else {
+		op = Op{OpID: args.OpID, Type: "Append", Key: args.Key, Value: args.Value, Ck: args.Ck, LastID: args.LastID}
 	}
+	reply.Err = kv.handleReq(args.OpID, key2shard(args.Key), op)
 
 	return nil
 }
 
 func (kv *DisKV) doUpdate(op Op) {
-	if kv.Current.Num == op.View {
+	if kv.current.Num == op.View {
 		if op.Update != nil {
 			for k, v := range op.Update {
-				kv.Data[k] = v
+				kv.data[k] = v
 			}
 		}
 		for _, i := range op.Shards {
-			kv.HasShard[i] = true
+			kv.hasShard[i] = true
 		}
 		for k, v := range op.Clients {
-			kv.SeenOpID[k] = v
+			kv.seenOpID[k] = v
 		}
-		delete(kv.Outstanding, op.GID)
+		delete(kv.outstanding, op.GID)
 	}
 }
 
@@ -350,16 +334,15 @@ func (kv *DisKV) Update(args *UpdateArgs, reply *UpdateReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	op := Op{Type: "Update", Update: args.Data, View: args.View, GID: args.From,
-		Shards: args.Shards, Clients: args.Clients}
+	op := Op{Type: "Update", Update: args.Data, View: args.View, GID: args.From, Shards: args.Shards, Clients: args.Clients}
 	for !kv.isdead() {
-		if op.View == kv.Current.Num {
-			if kv.Outstanding[args.From] == false {
+		if op.View == kv.current.Num {
+			if kv.outstanding[args.From] == false {
 				reply.Err = OK
 				return nil
 			}
-			kv.Seq++
-			seq := kv.Seq
+			kv.seq++
+			seq := kv.seq
 
 			kv.px.Start(seq, op)
 			xop := kv.getOp(seq)
@@ -369,7 +352,7 @@ func (kv *DisKV) Update(args *UpdateArgs, reply *UpdateReply) error {
 				reply.Err = OK
 				return nil
 			}
-		} else if op.View > kv.Current.Num {
+		} else if op.View > kv.current.Num {
 			reply.Err = ErrTryAgain
 			return nil
 		} else {
@@ -398,7 +381,7 @@ func (kv *DisKV) sendUpdates(servers []string, msg map[string]string, shards []i
 }
 
 func (kv *DisKV) doReconfig(op Op) {
-	if kv.Current.Num != op.Config.Num-1 {
+	if kv.current.Num != op.Config.Num-1 {
 		return
 	}
 
@@ -407,27 +390,27 @@ func (kv *DisKV) doReconfig(op Op) {
 
 	for i := 0; i < shardmaster.NShards; i++ {
 		// find shards to send
-		if (op.Config.Shards[i] != kv.gid) && (kv.Current.Shards[i] == kv.gid) {
-			kv.HasShard[i] = false
+		if (op.Config.Shards[i] != kv.gid) && (kv.current.Shards[i] == kv.gid) {
+			kv.hasShard[i] = false
 			shards[op.Config.Shards[i]] = append(shards[op.Config.Shards[i]], i)
 		}
 
-		// set outstanding flag for shards to be received
-		if (op.Config.Shards[i] == kv.gid) && (kv.Current.Shards[i] != kv.gid) && op.Config.Num != 1 {
-			kv.Outstanding[kv.Current.Shards[i]] = true
+		// set outstanding flag
+		if (op.Config.Shards[i] == kv.gid) && (kv.current.Shards[i] != kv.gid) && op.Config.Num != 1 {
+			kv.outstanding[kv.current.Shards[i]] = true
 		}
 
 		// first group
 		if op.Config.Num == 1 && op.Config.Shards[0] == kv.gid {
-			kv.HasShard[i] = true
+			kv.hasShard[i] = true
 		}
 
 	}
 
-	for k, v := range kv.Data {
+	for k, v := range kv.data {
 		// write messages
 		shard := key2shard(k)
-		if (op.Config.Shards[key2shard(k)] != kv.gid) && (kv.Current.Shards[key2shard(k)] == kv.gid) {
+		if (op.Config.Shards[key2shard(k)] != kv.gid) && (kv.current.Shards[key2shard(k)] == kv.gid) {
 			if msg[op.Config.Shards[shard]] == nil {
 				msg[op.Config.Shards[shard]] = make(map[string]string)
 			}
@@ -435,26 +418,13 @@ func (kv *DisKV) doReconfig(op Op) {
 		}
 	}
 
-	kv.Current = op.Config
+	kv.current = op.Config
 
 	for gid, servers := range op.Config.Groups {
 		// send updates
 		if gid != kv.gid && len(shards[gid]) > 0 {
-			go kv.sendUpdates(servers, msg[gid], shards[gid], copyMap(kv.SeenOpID), op.Config.Num, gid)
+			go kv.sendUpdates(servers, msg[gid], shards[gid], copyMap(kv.seenOpID), op.Config.Num, gid)
 		}
-	}
-}
-
-func fateString(f paxos.Fate) string {
-	switch f {
-	case paxos.Decided:
-		return "Decided"
-	case paxos.Pending:
-		return "Pending"
-	case paxos.Forgotten:
-		return "Forgotten"
-	default:
-		return ""
 	}
 }
 
@@ -462,9 +432,9 @@ func (kv *DisKV) reconfigure(config shardmaster.Config) {
 	op := Op{Type: "Reconfig", Config: config}
 	for !kv.isdead() {
 		// check if up to date before reconfiging
-		if len(kv.Outstanding) == 0 {
-			kv.Seq++
-			seq := kv.Seq
+		if len(kv.outstanding) == 0 {
+			kv.seq++
+			seq := kv.seq
 
 			kv.px.Start(seq, op)
 			xop := kv.getOp(seq)
@@ -475,10 +445,10 @@ func (kv *DisKV) reconfigure(config shardmaster.Config) {
 			}
 		} else {
 			// try to catch up
-			status, val := kv.px.Status(kv.Seq + 1)
+			status, val := kv.px.Status(kv.seq + 1)
 			if status == paxos.Decided {
-				kv.Seq++
-				kv.process(val.(Op), kv.Seq, 0)
+				kv.seq++
+				kv.process(val.(Op), kv.seq, 0)
 			}
 			return
 		}
@@ -494,19 +464,11 @@ func (kv *DisKV) tick() {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	nconfig := kv.sm.Query(-1)
-	if nconfig.Num > kv.Current.Num {
-		if nconfig.Num > kv.Current.Num+1 {
-			nconfig = kv.sm.Query(kv.Current.Num + 1)
+	if nconfig.Num > kv.current.Num {
+		if nconfig.Num > kv.current.Num+1 {
+			nconfig = kv.sm.Query(kv.current.Num + 1)
 		}
 		kv.reconfigure(nconfig)
-	} else {
-		op := Op{Type: "Heartbeat", View: kv.me, Ck: rand.Int63()}
-		kv.Seq++
-		seq := kv.Seq
-
-		kv.px.Start(seq, op)
-		xop := kv.getOp(seq)
-		kv.process(xop, seq, 0)
 	}
 }
 
@@ -536,113 +498,6 @@ func (kv *DisKV) isunreliable() bool {
 	return atomic.LoadInt32(&kv.unreliable) != 0
 }
 
-func (kv *DisKV) Copy(args *RecoverArgs, reply *RecoverReply) error {
-	kv.mu.Lock()
-	kv.px.Lock()
-	var buf1, buf2 bytes.Buffer
-	encoder := gob.NewEncoder(&buf1)
-	encoder.Encode(kv)
-	reply.Kv = buf1.String()
-
-	encoder = gob.NewEncoder(&buf2)
-	encoder.Encode(kv.px)
-	reply.Px = buf2.String()
-
-	reply.Err = OK
-	kv.px.Unlock()
-	kv.mu.Unlock()
-	return nil
-}
-
-func (kv *DisKV) Recover(disk bool) {
-	kv.mu.Lock()
-	fmt.Printf("RECOVERING SERVER %d ---- DISK %t\n", kv.me, disk)
-	kv.recovery = !disk
-
-	var k DisKV
-	if disk {
-		// recover from disk
-		file, err := os.Open(kv.dir + "/kv")
-		if err == nil {
-			decoder := gob.NewDecoder(file)
-			decoder.Decode(&k)
-		}
-		file.Close()
-		kv.px.Recover(disk, "")
-	} else {
-		// get recovery data from someone else
-		config := kv.sm.Query(-1)
-		args := &RecoverArgs{}
-		var reply RecoverReply
-		done := false
-
-		for !done {
-			for _, srv := range config.Groups[kv.gid] {
-				// send copy requests
-				ok := call(srv, "DisKV.Copy", args, &reply)
-				if ok && reply.Err == OK {
-					done = true
-
-					// get kv data
-					decoder := gob.NewDecoder(bytes.NewBufferString(reply.Kv))
-					decoder.Decode(&k)
-
-					// set up paxos for recovery
-					kv.px.Recover(disk, reply.Px)
-					break
-				} else if reply.Err == ErrWrongGroup {
-					config = kv.sm.Query(-1)
-					break
-				}
-			}
-		}
-	}
-
-	kv.recovery = !disk
-
-	kv.Seq = k.Seq
-	kv.Current = k.Current
-	kv.Data = k.Data
-	kv.SeenOpID = k.SeenOpID
-	kv.HasShard = k.HasShard
-	kv.Outstanding = k.Outstanding
-
-	if k.SeenOpID == nil {
-		kv.SeenOpID = make(map[int64]int)
-	}
-	if k.Outstanding == nil {
-		kv.Outstanding = make(map[int64]bool)
-	}
-	if k.Data == nil {
-		kv.Data = make(map[string]string)
-	}
-
-	if !disk {
-		kv.finishRecovery()
-	}
-	fmt.Printf("RECOVERED SERVER %d %d\n", kv.me, kv.Seq)
-
-	kv.mu.Unlock()
-}
-
-func (kv *DisKV) finishRecovery() {
-	op := Op{Type: "Recovery", View: kv.me, Ck: rand.Int63()}
-	for !kv.isdead() {
-		kv.Seq++
-		seq := kv.Seq
-
-		kv.px.Start(seq, op)
-		xop := kv.getOp(seq)
-		kv.process(xop, seq, 0)
-
-		if xop.Type == "Recovery" && xop.Ck == op.Ck && xop.View == op.View {
-			kv.recovery = false
-			kv.px.FinishRecovery()
-			break
-		}
-	}
-}
-
 //
 // Start a shardkv server.
 // gid is the ID of the server's replica group.
@@ -670,32 +525,20 @@ func StartServer(gid int64, shardmasters []string,
 	// Your initialization code here.
 	// Don't call Join().
 
-	// fmt.Printf("STARTING SERVER %d!\n", kv.me)
-
-	log.SetOutput(ioutil.Discard)
+	// log.SetOutput(ioutil.Discard)
 
 	gob.Register(Op{})
+
+	kv.data = make(map[string]string)
+	kv.seenOpID = make(map[int64]int)
+	kv.outstanding = make(map[int64]bool)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
 
 	kv.px = paxos.Make(servers, me, rpcs)
-	kv.px.SetSave(kv.dir + "/paxos")
-	kv.px.SetPrint(true)
 
-	if restart {
-		_, err := os.Stat(kv.dir + "/kv")
-		kv.Recover(!os.IsNotExist(err))
-	} else {
-		// starting first time
-		kv.Data = make(map[string]string)
-		kv.SeenOpID = make(map[int64]int)
-		kv.Outstanding = make(map[int64]bool)
-		var a [shardmaster.NShards]int64
-		kv.Current = shardmaster.Config{Num: 0, Shards: a, Groups: nil}
-	}
-
-	log.SetOutput(os.Stdout)
+	// log.SetOutput(os.Stdout)
 
 	os.Remove(servers[me])
 	l, e := net.Listen("unix", servers[me])
@@ -735,22 +578,6 @@ func StartServer(gid int64, shardmasters []string,
 			}
 		}
 	}()
-
-	// go func() {
-	// 	for !kv.isdead() {
-	// 		kv.mu.Lock()
-	// 		status, val := kv.px.Status(kv.Seq + 1)
-	// 		if Debug != 0 {
-	// 			fmt.Printf("%d TICK! --- %d %s\n", kv.me, kv.Seq+1, fateString(status))
-	// 		}
-	// 		if status == paxos.Decided {
-	// 			kv.Seq++
-	// 			kv.process(val.(Op), kv.Seq, 0)
-	// 		}
-	// 		kv.mu.Unlock()
-	// 		time.Sleep(250 * time.Millisecond)
-	// 	}
-	// }()
 
 	go func() {
 		for kv.isdead() == false {
