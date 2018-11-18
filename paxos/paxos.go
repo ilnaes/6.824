@@ -34,7 +34,7 @@ import "math/rand"
 import "time"
 import "encoding/gob"
 
-const Debug = true
+const Debug = false
 
 // px.Status() return Values, indicating
 // whether an agreement has been decided,
@@ -286,9 +286,6 @@ func (px *Paxos) Accept(args AcceptArgs, reply *AcceptReply) error {
 
 func (px *Paxos) Decided(args DecidedArgs, reply *DecidedReply) error {
 	px.mu.Lock()
-	// if px.printing && Debug {
-	// 	fmt.Printf("DECIDED %d %d %t\n", px.me, args.Seq, px.recovery)
-	// }
 	px.Stati[args.Seq] = Decided
 	px.Val[args.Seq] = args.Val
 	px.log()
@@ -370,10 +367,10 @@ func (px *Paxos) propose(Seq int, v interface{}) {
 
 	// while not decided
 	for !px.isDecided(Seq) && !px.isdead() {
-		if px.printing && px.me == 2 {
-			fmt.Printf("PROPOSE %d %d %t --- ", px.me, Seq, px.recovery)
-			fmt.Println(v)
-		}
+		// if px.printing && px.me == 2 {
+		// 	fmt.Printf("PROPOSE %d %d %t --- ", px.me, Seq, px.recovery)
+		// 	fmt.Println(v)
+		// }
 		px.mu.Lock()
 		n := px.Hiprepare[Seq] + 1
 		px.mu.Unlock()
@@ -393,6 +390,11 @@ func (px *Paxos) propose(Seq int, v interface{}) {
 		if acceptAccepted <= len(px.peers)/2 {
 			time.Sleep(time.Duration(rand.Int63n(20)) * time.Millisecond)
 			continue
+		}
+
+		if px.printing && Debug {
+			fmt.Printf("%d DECIDED %d --- ", px.me, Seq)
+			fmt.Println(v)
 		}
 
 		// send decided
@@ -462,8 +464,8 @@ func (px *Paxos) Start(seq int, v interface{}) {
 	px.mu.Lock()
 	s, ok := px.Stati[seq]
 	// fmt.Printf("STILL GOING! %d %#v\n", seq, v)
-	if px.printing && px.me == 2 && Debug {
-		fmt.Printf("START %d %d %t --- %s ", px.me, seq, px.recovery, fateString(s))
+	if px.printing && px.me == 0 && Debug {
+		fmt.Printf("START %d %d --- %s ", px.me, seq, fateString(s))
 		fmt.Println(v)
 	}
 

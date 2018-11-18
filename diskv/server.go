@@ -242,8 +242,9 @@ func (kv *DisKV) handleReq(id int64, shard int, op Op) Err {
 }
 
 func (kv *DisKV) process(op Op, seq int, server int64) {
-	if Debug != 0 {
-		fmt.Printf("%d PROCESSING %d\n", kv.me, seq)
+	if kv.me == 0 && Debug != 0 {
+		fmt.Printf("%d PROCESSING %d  ", kv.me, seq)
+		fmt.Println(op)
 	}
 
 	if op.Type == "Reconfig" {
@@ -556,7 +557,6 @@ func (kv *DisKV) Copy(args *RecoverArgs, reply *RecoverReply) error {
 
 func (kv *DisKV) Recover(disk bool) {
 	kv.mu.Lock()
-	fmt.Printf("RECOVERING SERVER %d ---- DISK %t\n", kv.me, disk)
 	kv.recovery = !disk
 
 	var k DisKV
@@ -569,6 +569,7 @@ func (kv *DisKV) Recover(disk bool) {
 		}
 		file.Close()
 		kv.px.Recover(disk, "")
+		fmt.Printf("RECOVERING SERVER %d ---- HAVE DISK\n", kv.me)
 	} else {
 		// get recovery data from someone else
 		config := kv.sm.Query(-1)
@@ -577,22 +578,26 @@ func (kv *DisKV) Recover(disk bool) {
 		done := false
 
 		for !done {
-			for _, srv := range config.Groups[kv.gid] {
-				// send copy requests
-				ok := call(srv, "DisKV.Copy", args, &reply)
-				if ok && reply.Err == OK {
-					done = true
+			for i, srv := range config.Groups[kv.gid] {
+				if i != kv.me {
+					// send copy requests
+					ok := call(srv, "DisKV.Copy", args, &reply)
+					if ok && reply.Err == OK {
+						done = true
 
-					// get kv data
-					decoder := gob.NewDecoder(bytes.NewBufferString(reply.Kv))
-					decoder.Decode(&k)
+						fmt.Printf("RECOVERING SERVER %d FROM %d ---- LOST DISK\n", kv.me, i)
 
-					// set up paxos for recovery
-					kv.px.Recover(disk, reply.Px)
-					break
-				} else if reply.Err == ErrWrongGroup {
-					config = kv.sm.Query(-1)
-					break
+						// get kv data
+						decoder := gob.NewDecoder(bytes.NewBufferString(reply.Kv))
+						decoder.Decode(&k)
+
+						// set up paxos for recovery
+						kv.px.Recover(disk, reply.Px)
+						break
+					} else if reply.Err == ErrWrongGroup {
+						config = kv.sm.Query(-1)
+						break
+					}
 				}
 			}
 		}
