@@ -1,3 +1,4 @@
+/github.com/
 *.swp
 tags
 mrtmp.*
@@ -6,5 +7,4 @@ mrtmp.*
 /pbservice/x.txt
 /kvpaxos/x.txt
 /main/diskvd
-github.com
 log
